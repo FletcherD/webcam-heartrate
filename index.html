@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8">
+		<title>WebGL webcam dithering</title>
+		<style>
+			body {
+				margin: 0;
+				background-color: #000000;
+				overflow: hidden;
+			}
+			#message {
+			 	background: rgba(255, 255, 255, 0.75);
+			 	color: #000;
+			 	text-align: center;
+			 	position: absolute;
+			 	left: 0;
+			 	top: 0;
+			 	width: 100%;
+			 	padding: 10px;
+		 	}
+		</style>
+		
+	</head>
+	<body>
+		<script src="three.js"></script>
+		<script src="stats.min.js"></script>
+		
+		<script id="vs" type="x-shader/x-vertex">
+
+			uniform sampler2D map;
+
+			varying vec2 vUv;
+
+			void main() {
+
+				vUv = uv;
+
+				gl_Position = projectionMatrix * modelViewMatrix * vec4( position.xy, 0.0, 1.0 );
+
+			}
+
+		</script>
+
+		<script id="fs" type="x-shader/x-fragment">
+			#define AVERAGE_N 30.0
+
+			uniform sampler2D map;
+			uniform sampler2D oldBuffer;
+			
+			uniform vec3 averageColor;
+
+			varying vec2 vUv;
+			
+			vec3 rgb2ycbcr(vec3 color) {
+				const mat3  cMatrix 	= mat3 ( 0.299,  0.587,  0.114,
+					    						-0.168, -0.331,  0.500,
+			    								 0.500, -0.419, -0.008 );
+			
+			    // Convert to YIQ
+			    return color * cMatrix;
+			}
+			
+			bool isSkin(vec3 ycbcr) {
+				return (ycbcr.y >= 0.40 && ycbcr.y <= 0.52 && ycbcr.z >= 0.582 && ycbcr.z <= 0.683);
+			}
+
+			void main() {
+
+				vec4 c = texture2D(map, vUv);
+				//c.rgb *= (vec3(0.5,0.5,0.5) / averageColor);
+				vec3 ycbcr = rgb2ycbcr(c.rgb);
+				
+				vec4 oldBuf = texture2D(oldBuffer, vUv);
+				
+				vec3 newBuf = vec3(oldBuf.r - (1.0/AVERAGE_N), 0.0, 0.0);
+				if(isSkin(ycbcr + 0.5)) {
+					newBuf.r += (2.0/AVERAGE_N);
+				}
+				newBuf.r = clamp(newBuf.r, 0.0, 1.0);
+				float redDiff = c.r - oldBuf.g;
+				newBuf.g = oldBuf.g + redDiff * 0.1;
+				redDiff = (c.r - newBuf.g);
+				newBuf.b = (newBuf.r * redDiff);
+				
+				gl_FragColor = vec4(newBuf, 1.0);
+			}
+		</script>
+
+		<script id="fs-copy" type="x-shader/x-fragment">
+
+			uniform sampler2D buffer;
+			varying vec2 vUv;
+
+			void main() {
+				
+				vec4 c = texture2D(buffer, vUv);
+				gl_FragColor = c;
+			}
+		</script>
+		
+		<script id="fs-display" type="x-shader/x-fragment">
+
+			uniform sampler2D resultBuffer;
+			varying vec2 vUv;
+			
+			uniform float curBeat;
+			uniform vec2 curRange;
+
+			void main() {
+				
+				vec4 c = texture2D(resultBuffer, vUv);
+				float beat = curBeat;//(curBeat - curRange.x) / (curRange.y - curRange.x);
+				beat = c.b * c.r * 1.0E2;
+				gl_FragColor = vec4(c.r-abs(beat), beat, -beat, 1.0);
+			}
+		</script>
+		
+		<script id="fs-downscale" type="x-shader/x-fragment">
+
+			uniform sampler2D buffer;
+			uniform vec2 pixSize;
+			varying vec2 vUv;
+
+			void main() {
+				vec4 color = 
+					texture2D(buffer, vUv - pixSize) +
+					texture2D(buffer, vUv - vec2( pixSize.x,0)) +
+					texture2D(buffer, vUv - vec2(0, pixSize.y)) +
+					texture2D(buffer, vUv);
+				gl_FragColor = vec4(color.rgb/4.0, 1.0);
+			}
+		</script>
+		
+		<script>
+			
+			var stats = new Stats();
+			stats.setMode( 0 ); // 0: fps, 1: ms, 2: mb
+			
+			// align top-left
+			stats.domElement.style.position = 'absolute';
+			stats.domElement.style.left = '0px';
+			stats.domElement.style.top = '0px';
+			document.body.appendChild( stats.domElement );
+			
+			// webcam
+			window.URL = window.URL || window.webkitURL || window.mozURL || window.msURL;
+			navigator.getUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia || navigator.msGetUserMedia;
+			
+			var video = document.createElement( 'video' );
+			video.autoplay = true;
+			
+			video.addEventListener( 'loadedmetadata', function ( event ) {
+
+				video.style.width = video.videoWidth + 'px';
+				video.style.height = video.videoHeight + 'px';
+				
+				init();
+			
+			} );
+			var hdConstraints = {
+			  video: {
+			    mandatory: {
+			      minWidth: 1280,
+			      minHeight: 720
+			    }
+			  }
+			};
+			var successCallback = function(stream) {
+
+				video.src = window.URL.createObjectURL( stream );
+				
+			};
+			var errorCallback = function ( error ) {
+			
+				navigator.getUserMedia( { video: true }, successCallback.bind(this), 
+					function(error) {
+						console.log( error );
+					} );
+			
+			};
+			navigator.getUserMedia(hdConstraints, successCallback.bind(this), errorCallback.bind(this));
+			
+			// 3d
+			
+			var camera, scene, sceneCopy, sceneDisplay, sceneDownscale, renderer;
+			var texCamera, texCameraBuf, texScaleBuf;
+			var material, materialCopy, materialDisplay, materialDownscale;
+			var curBuf = 0;
+			var curScaleBuf = 0;
+			var clock;
+			
+			var frameCount = 0;
+			var size;
+			
+			var tintHistory = [];
+			var filteredHistory = [];
+			var plotScene, plotGeometry, plotLine;
+			
+			var init = function () {
+				
+				console.log("Video Size: " + video.videoWidth + " x " + video.videoHeight);
+				size = [video.videoWidth, video.videoHeight];
+			
+				camera = new THREE.OrthographicCamera( size[0]/-2, size[0]/2, size[1]/2, size[1]/-2, -500, 1000 );
+				camera.position.z = 500;
+				
+				scene = new THREE.Scene();
+				sceneCopy = new THREE.Scene();
+				sceneDisplay = new THREE.Scene();
+				sceneDownscale = new THREE.Scene();
+				
+				clock = new THREE.Clock();
+				clock.start();
+				
+				texCamera = new THREE.Texture( video );
+				texCamera.minFilter = THREE.LinearFilter;
+				texCamera.magFilter = THREE.LinearFilter;
+				texCamera.format = THREE.RGBFormat;
+				texCamera.generateMipmaps = false;
+				texCamera.needsUpdate = true;
+				
+				var texCameraBuf1 = new THREE.WebGLRenderTarget( video.videoWidth, video.videoHeight, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, type: THREE.FloatType } );
+				var texCameraBuf2 = new THREE.WebGLRenderTarget( video.videoWidth, video.videoHeight, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, type: THREE.FloatType } );
+				texCameraBuf = [texCameraBuf1, texCameraBuf2];
+				
+				var texScaleBuf1 = new THREE.WebGLRenderTarget( video.videoWidth, video.videoHeight, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, type: THREE.FloatType } );
+				var texScaleBuf2 = new THREE.WebGLRenderTarget( video.videoWidth, video.videoHeight, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, type: THREE.FloatType } );
+				texScaleBuf = [texScaleBuf1, texScaleBuf2];
+				
+				var geometry = new THREE.PlaneGeometry( video.videoWidth, video.videoHeight );
+				
+				material = new THREE.ShaderMaterial( {
+
+					uniforms: {
+						"map": 		{ type: "t", value: texCamera },
+						"oldBuffer": { type: "t", value: texCameraBuf[Number(!curBuf)] },
+						"averageColor": { type: "v3", value: new THREE.Vector3(0.5,0.5,0.5) }
+					},
+					vertexShader: document.getElementById( 'vs' ).textContent,
+					fragmentShader: document.getElementById( 'fs' ).textContent
+
+				} );
+				
+				materialCopy = new THREE.ShaderMaterial( {
+
+					uniforms: {
+						"buffer": { type: "t", value: texCameraBuf[curBuf] },
+					},
+					vertexShader: document.getElementById( 'vs' ).textContent,
+					fragmentShader: document.getElementById( 'fs-copy' ).textContent
+
+				} );
+				materialDisplay = new THREE.ShaderMaterial( {
+
+					uniforms: {
+						"resultBuffer": { type: "t", value: texCameraBuf[curBuf] },
+						"curBeat": { type: "f", value: 0 },
+						"curRange": { type: "v2", value: new THREE.Vector2(2E-3, 2E3) }
+					},
+					vertexShader: document.getElementById( 'vs' ).textContent,
+					fragmentShader: document.getElementById( 'fs-display' ).textContent
+
+				} );
+				
+				materialDownscale = new THREE.ShaderMaterial( {
+
+					uniforms: {
+						"buffer": { type: "t", value: texScaleBuf[curScaleBuf] },
+						"pixSize": { type: "v2", value: new THREE.Vector2(1/video.videoWidth, 1/video.videoHeight) }
+					},
+					vertexShader: document.getElementById( 'vs' ).textContent,
+					fragmentShader: document.getElementById( 'fs-downscale' ).textContent,
+					transparent: true
+				} );
+				
+				var mesh = new THREE.Mesh( geometry, material );
+				scene.add( mesh );
+				
+				var meshCopy = new THREE.Mesh( geometry, materialCopy );
+				sceneCopy.add( meshCopy );
+				
+				var meshDisplay = new THREE.Mesh( geometry, materialDisplay );
+				sceneDisplay.add( meshDisplay );
+				
+				var meshDownscale = new THREE.Mesh( geometry, materialDownscale );
+				sceneDownscale.add( meshDownscale );
+				
+				renderer = new THREE.WebGLRenderer({alpha: true, premultipliedAlpha:false});
+				renderer.setSize( video.videoWidth, video.videoHeight );
+				renderer.autoClear = false;
+				document.body.appendChild( renderer.domElement );
+				//renderer.domElement.style.width = window.innerWidth + 'px';
+				//renderer.domElement.style.height = window.innerHeight + 'px';
+				
+				animate();
+			
+			};
+			
+			var animate = function () {
+			
+				requestAnimationFrame( animate );
+				
+				if ( video.readyState === video.HAVE_ENOUGH_DATA 
+					&& video.webkitDecodedFrameCount != frameCount) {
+					frameCount = video.webkitDecodedFrameCount;
+					texCamera.needsUpdate = true;
+					
+					//if(frameCount % 3 == 0) {
+						stats.begin();
+	
+						camera = new THREE.OrthographicCamera( size[0]/-2, size[0]/2, size[1]/2, size[1]/-2, -500, 1000 );
+						
+						renderer.clear();
+						renderer.setViewport(0, 0, video.videoWidth, video.videoHeight);
+						
+						if(frameCount % 100 == 0) {
+						var cameraAverages = getAverage(texCamera);
+						console.log(cameraAverages);
+						material.uniforms.averageColor.value = cameraAverages;
+						}
+						
+						renderer.render( scene, camera, texCameraBuf[curBuf], true );
+						
+						//renderer.render( sceneCopy, camera, texScaleBuf[curScaleBuf], true);
+						
+						getDataSample();
+						
+						//renderBuffer(texCameraBuf[curBuf]);
+						renderBeat();
+						
+						drawPlot();
+						
+						swapBuffers();
+						
+						stats.end();
+					//}
+				}
+			};
+			
+			var renderBuffer = function(buffer) {
+				
+				materialCopy.uniforms.buffer.value = buffer;
+				renderer.render( sceneCopy, camera );
+				
+			}
+			
+			var renderBeat = function() {
+				
+				materialDisplay.uniforms.resultBuffer.value = texCameraBuf[curBuf];
+				renderer.render( sceneDisplay, camera );
+			}
+			
+			var getDataSample = function() {
+				var vals = getAverage(texCameraBuf[curBuf]);
+				console.log(vals);
+				var sample = vals.z;
+				
+				//var firFilter = [0.0177, 0.0483, 0.1225, 0.1973, 0.2285, 0.1973, 0.1225, 0.0483, 0.0177];
+				var firFilter = [0.0355, 0.2410, 0.4471, 0.2410, 0.0355];
+				//var firFilter = [0.0082, 0.0123, 0.0237, 0.0412, 0.0625, 0.0843, 0.1031, 0.1158, 0.1203, 0.1158, 0.1031, 0.0843, 0.0625, 0.0412, 0.0237, 0.0123, 0.0082];
+				
+				tintHistory.push(sample);
+				var accum = 0;
+				for(var i = 0; i < Math.min(tintHistory.length, firFilter.length); i++) {
+					accum += firFilter[i] * tintHistory[tintHistory.length - i - 1];
+				}
+				filteredHistory.push(accum);
+				materialDisplay.uniforms.curBeat.value = accum;
+				//console.log(accum);
+				/*
+				var RANGE_LENGTH = 30;
+				var range = new THREE.Vector2(Infinity, -Infinity);
+				var avg = 0;
+				for(var i = 0; i < Math.min(RANGE_LENGTH, filteredHistory.length); i++) {
+					avg += filteredHistory[filteredHistory.length - i - 1];
+					range.x = Math.min(range.x, filteredHistory[filteredHistory.length - i - 1]);
+					range.y = Math.max(range.y, filteredHistory[filteredHistory.length - i - 1]);
+				}
+				avg /= RANGE_LENGTH;
+				accum -= avg;
+				//materialDisplay.uniforms.curBeat.value = accum;
+				//console.log(accum);
+				materialDisplay.uniforms.curRange.value = new THREE.Vector2(-2E-5, 2E-5);
+				*/
+			}
+			
+			var getAverage = function(buffer) {
+				var scaleFac = 1;
+				for(var i = 0; i < 2; i++) {
+					
+					scaleFac *= 4;
+					renderer.setViewport(0, 0, (video.videoWidth)/scaleFac, video.videoHeight/scaleFac);
+					var scaleCamera = new THREE.OrthographicCamera( size[0]/-2, size[0]/-2+size[0]*(4/scaleFac), size[1]/-2+size[1]*(4/scaleFac), size[1]/-2, -500, 1000 );
+					materialDownscale.uniforms.buffer.value = (i==0) ? buffer : texScaleBuf[curScaleBuf];
+					materialDownscale.uniforms.pixSize.value = new THREE.Vector2(1/(video.videoWidth),1/(video.videoHeight));
+					renderer.render( sceneDownscale, scaleCamera, texScaleBuf[Number(!curScaleBuf)], true );
+					//renderer.render( sceneDownscale, scaleCamera );
+					
+					curScaleBuf = Number(!curScaleBuf);
+				}
+				var finalSize = [video.videoWidth/scaleFac, video.videoHeight/scaleFac];
+				
+				var pixels = new Float32Array(4 * finalSize[0] * finalSize[1]);
+				var gl = renderer.getContext();
+				//gl.bindFramebuffer(gl.FRAMEBUFFER, texScaleBuf[curScaleBuf].__webglFramebuffer);
+				gl.readPixels(0, 0, finalSize[0], finalSize[1], gl.RGBA, gl.FLOAT, pixels);
+				//gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+				//console.log(pixels);
+				
+				renderer.setViewport(0, 0, video.videoWidth, video.videoHeight);
+				
+				var i = 0;
+				var vals = [0,0,0,0];
+				pixels.forEach(function(val) {
+					vals[i%4] += val;
+					i++;
+				});
+				for(var i = 0; i < 4; i++) {
+					vals[i] /= finalSize[0] * finalSize[1];
+				}
+				return new THREE.Vector3(vals[0], vals[1], vals[2]);
+			}
+			
+			var swapBuffers = function() {
+				curBuf = Number(!curBuf);
+				
+				material.uniforms.oldBuffer.value = texCameraBuf[Number(!curBuf)];
+				materialCopy.uniforms.buffer.value = texCameraBuf[curBuf];
+			}
+			
+			var createPlot = function() {
+				plotScene = new THREE.Scene();
+				plotGeometry = new THREE.Geometry();
+				for(i = 0; i < 100; i++) {
+					plotGeometry.vertices.push(new THREE.Vector3(i, 0, 0));
+					plotGeometry.colors.push(new THREE.Vector3(1,1,1));
+				}
+				var plotMaterial = new THREE.LineBasicMaterial( { color: 0xffffff, linewidth: 100 } );
+				plotLine = new THREE.Line(plotGeometry, plotMaterial);
+				plotScene.add(plotLine);
+			}
+			
+			var drawPlot = function() {
+				if(!plotScene)
+					createPlot();
+				var plotCamera = new THREE.OrthographicCamera( 0, 100, 1, 0.5, -500, 1000 );
+				if(filteredHistory.length > 2) {
+					var mean = 0;
+					for(i = 0; i < Math.min(filteredHistory.length, 100); i++) {
+						plotGeometry.vertices[i].y = filteredHistory[tintHistory.length-i-1];
+						mean += filteredHistory[filteredHistory.length-i-1];
+					}
+					mean /= Math.min(filteredHistory.length, 100);
+					mean = Math.round(mean * 1000)/1000;
+					plotCamera = new THREE.OrthographicCamera( 0, 100, mean+0.002, mean-0.002, -500, 1000 );
+					plotLine.geometry.verticesNeedUpdate = true;
+				}
+				renderer.render(plotScene, plotCamera);
+			}
+		
+		</script>
+		</body>
+</html>
